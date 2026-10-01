@@ -1,0 +1,146 @@
+#!/bin/bash
+#
+# netwatchdog -- get the wireless link back when the driver's scan path wedges.
+#
+# Background: on some drivers iwd's scan requests are rejected --
+#   iwd[383]: Received error during CMD_TRIGGER_SCAN: Invalid argument (22)
+# -- so after an ordinary deauth or beacon loss a board can sit disconnected
+# for hours, or days, waiting for a scan to get through. The board is up and
+# healthy and retrying the whole time; it just never gets back on.
+#
+# Seen on BeagleBone boards with wl18xx (onboard TI) and rt2800usb radios.
+# rtw_8821cu boards re-associate in a few seconds and never reach the first
+# threshold. The script is deliberately driver-agnostic: it judges carrier and
+# address and restarts whichever supplicant is running, so it is correct on any
+# radio and simply does nothing where the link heals itself.
+#
+# Scanning does work from a fresh daemon start -- boards associate within
+# seconds at boot -- so restarting the supplicant is usually enough to get back
+# on. This escalates: restart the supplicant, then bounce the interface too,
+# then keep retrying rather than giving up, and as a last resort reboot.
+#
+# Also reclaims the mDNS hostname. When a board rejoins after an absence, avahi
+# can find its name still announced on its behalf and rename itself (myboard ->
+# myboard-2). It never reverts, so the board is back on the LAN but
+# myboard.local stops resolving, which looks identical to still being down.
+#
+# Runs from netwatchdog.timer. Silent unless it acts or the state changes.
+# Settings can be overridden in /etc/default/netwatchdog (see the README).
+
+STATE=/run/netwatchdog.state
+WASUP=/run/netwatchdog.wasup       # proof the link worked at least once this boot
+RESTART_AFTER=${RESTART_AFTER:-180}    # seconds down before restarting the supplicant
+BOUNCE_AFTER=${BOUNCE_AFTER:-420}      # seconds down before also bouncing the interface
+RETRY_EVERY=${RETRY_EVERY:-600}        # seconds between retries once escalated
+REBOOT_AFTER=${REBOOT_AFTER:-3600}     # seconds down before rebooting; 0 never reboots
+SETTLE=${SETTLE:-120}                  # grace between escalation steps
+IPV4_REQUIRED=${IPV4_REQUIRED:-no}     # yes: only an IPv4 address counts as connected
+RECLAIM_MDNS_NAME=${RECLAIM_MDNS_NAME:-yes}
+
+log() { echo "$*"; }
+
+# The first wireless interface, unless one is named. Boards with none exit.
+iface=${INTERFACE:-}
+if [ -z "$iface" ]; then
+    for d in /sys/class/net/*; do
+        if [ -e "$d/phy80211" ]; then iface=$(basename "$d"); break; fi
+    done
+fi
+[ -z "$iface" ] && exit 0
+
+supplicant() {
+    local s
+    for s in iwd wpa_supplicant "wpa_supplicant@$iface"; do
+        if systemctl is-active --quiet "$s" 2>/dev/null; then echo "$s"; return; fi
+    done
+}
+
+# Connected means a carrier and an address that routes. A global IPv6 address
+# counts as well, so a network without IPv4 isn't taken for one that's down.
+link_healthy() {
+    [ "$(cat "/sys/class/net/$iface/carrier" 2>/dev/null)" = "1" ] || return 1
+    [ -n "$(ip -4 -br addr show dev "$iface" scope global 2>/dev/null | awk '{print $3}')" ] && return 0
+    [ "$IPV4_REQUIRED" = "yes" ] && return 1
+    [ -n "$(ip -6 -br addr show dev "$iface" scope global -tentative 2>/dev/null | awk '{print $3}')" ]
+}
+
+# If avahi renamed us, give it our real hostname back. Only when nothing else
+# answers for that name -- if another host legitimately holds it, renaming was
+# correct and taking it back would just flap.
+reclaim_mdns_name() {
+    local cur want addr
+    [ "$RECLAIM_MDNS_NAME" = "yes" ] || return 0
+    command -v dbus-send >/dev/null 2>&1 || return 0
+    cur=$(dbus-send --system --print-reply=literal --dest=org.freedesktop.Avahi \
+              / org.freedesktop.Avahi.Server.GetHostName 2>/dev/null | awk '{print $NF}')
+    want=$(hostname)
+    [ -z "$cur" ] && return 0
+    [ "${cur,,}" = "${want,,}" ] && return 0
+    # avahi-resolve exits 0 even when nothing answers, so judge by its output.
+    # Only stand down if a DIFFERENT host holds the name -- an answer carrying
+    # one of our own addresses is our own record echoed back, not a conflict.
+    addr=$(avahi-resolve -n "$want.local" 2>/dev/null | awk '{print $2}')
+    if [ -n "$addr" ] && ! ip -br addr show | grep -qwF "$addr"; then
+        log "mDNS name is '$cur', but $want.local answers from $addr -- leaving it"
+        return 0
+    fi
+    # Set the name on the running daemon. Restarting avahi-daemon would also
+    # restart every service that Requires it, for what is only a name.
+    if avahi-set-host-name "$want" 2>/dev/null; then
+        log "avahi renamed this board to '$cur'; set it back to $want.local"
+    else
+        log "avahi renamed this board to '$cur'; restarting avahi-daemon to reclaim $want.local"
+        systemctl restart avahi-daemon
+    fi
+}
+
+now=$(date +%s)
+
+if link_healthy; then
+    if [ -f "$STATE" ]; then
+        read -r firstdown _ _ < "$STATE"
+        log "$iface healthy again after $(( (now - firstdown) / 60 )) min down"
+        rm -f "$STATE"
+    fi
+    touch "$WASUP"
+    reclaim_mdns_name
+    exit 0
+fi
+
+if [ -f "$STATE" ]; then
+    read -r firstdown level lastact < "$STATE"
+else
+    firstdown=$now; level=0; lastact=0
+    log "$iface is down (no carrier or no address); watching"
+fi
+down=$(( now - firstdown ))
+since=$(( now - lastact ))
+sup=$(supplicant)
+
+if [ "$level" -eq 0 ] && [ "$down" -ge "$RESTART_AFTER" ]; then
+    log "$iface down ${down}s -- restarting ${sup:-supplicant}"
+    [ -n "$sup" ] && systemctl restart "$sup"
+    level=1; lastact=$now
+elif [ "$level" -eq 1 ] && [ "$down" -ge "$BOUNCE_AFTER" ] && [ "$since" -ge "$SETTLE" ]; then
+    log "$iface still down ${down}s -- bouncing the interface and restarting ${sup:-supplicant}"
+    ip link set "$iface" down; sleep 2; ip link set "$iface" up
+    [ -n "$sup" ] && systemctl restart "$sup"
+    level=2; lastact=$now
+elif [ "$level" -ge 2 ] && [ "$REBOOT_AFTER" -gt 0 ] && [ "$down" -ge "$REBOOT_AFTER" ] && [ -f "$WASUP" ]; then
+    # Last resort. Boards associate within seconds of booting, so this works
+    # -- but only when this board has been on the network since it booted.
+    # Without that proof the credentials or the AP may simply be wrong, and
+    # rebooting hourly would achieve nothing but a boot loop.
+    log "$iface down $(( down / 60 )) min despite restarts and bounces -- rebooting"
+    echo "$firstdown $level $now" > "$STATE"
+    systemctl reboot
+    exit 0
+elif [ "$level" -ge 2 ] && [ "$since" -ge "$RETRY_EVERY" ]; then
+    log "$iface down $(( down / 60 )) min -- retrying bounce + ${sup:-supplicant} restart"
+    ip link set "$iface" down; sleep 2; ip link set "$iface" up
+    [ -n "$sup" ] && systemctl restart "$sup"
+    lastact=$now
+fi
+
+echo "$firstdown $level $lastact" > "$STATE"
+exit 0

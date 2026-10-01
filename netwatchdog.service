@@ -1,0 +1,11 @@
+[Unit]
+Description=Wireless link watchdog
+# Boards with no wireless interface have nothing to watch. An unmet condition
+# marks the unit skipped rather than failed, so no restart is scheduled.
+ConditionPathExistsGlob=/sys/class/net/*/phy80211
+After=network.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/netwatchdog
+ExecStart=/usr/local/sbin/netwatchdog

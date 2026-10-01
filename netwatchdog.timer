@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the wireless link watchdog periodically
+
+[Timer]
+# Start well after boot so the initial association has every chance to finish
+# on its own, then check every minute. The script itself gates how long the
+# link must be down before it acts, so checking often costs nothing.
+OnBootSec=4min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=netwatchdog.service
+
+[Install]
+WantedBy=timers.target
